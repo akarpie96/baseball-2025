@@ -157,6 +157,7 @@ def pitcher_postseason_logs(player_id: int, season: int):
 # Opponent / league summaries
 # =========================
 def team_batting_summary(team_id: int, season: int):
+    """Team batting (for K% and contact proxy via H/PA)."""
     url = f"{BASE}/teams/stats"
     params = {"group": "hitting", "season": season, "sportId": 1, "teamId": team_id}
     r = requests.get(url, params=params, timeout=30)
@@ -169,25 +170,27 @@ def team_batting_summary(team_id: int, season: int):
     return {
         "strikeOuts": _to_float(s.get("strikeOuts")),
         "plateAppearances": _to_float(s.get("plateAppearances")),
-        "gamesPlayed": _to_float(s.get("gamesPlayed")),
+        "hits": _to_float(s.get("hits")),
     }
 
 def league_batting_summary(season: int):
+    """League aggregates to normalize opponent tendencies."""
     url = f"{BASE}/teams/stats"
     params = {"group": "hitting", "season": season, "sportId": 1}
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     js = r.json()
     splits = (js.get("stats") or [{}])[0].get("splits", [])
-    tot_K, tot_PA = 0.0, 0.0
+    tot_K, tot_PA, tot_H = 0.0, 0.0, 0.0
     for sp in splits:
         st = sp.get("stat", {}) or {}
         tot_K += _to_float(st.get("strikeOuts"))
         tot_PA += _to_float(st.get("plateAppearances"))
-    return {"strikeOuts": tot_K, "plateAppearances": tot_PA}
+        tot_H += _to_float(st.get("hits"))
+    return {"strikeOuts": tot_K, "plateAppearances": tot_PA, "hits": tot_H}
 
 # =========================
-# Projection: Ks + Outs
+# Projection: Ks + Outs + Hits Allowed
 # =========================
 def project_pitcher_strikeouts(player_id: int, season: int, last_n: int, opp_team_id: int = None, playoff_downweight: float = 0.75):
     """Projected strikeouts (lambda) with postseason downweight and opponent K-rate multiplier."""
@@ -215,7 +218,7 @@ def project_pitcher_strikeouts(player_id: int, season: int, last_n: int, opp_tea
     k_ip_season = safe_div(wsum(logs["strikeOuts"], logs["weight"]), wsum(logs["inningsPitched"], logs["weight"]))
     k_ip = 0.65 * k_ip_recent + 0.35 * k_ip_season
 
-    # Expected IP (favor recent if we have enough starts)
+    # Expected IP (favor recent if enough starts)
     exp_ip_recent = safe_div(wsum(recent["inningsPitched"], recent["weight"]), recent["weight"].sum() if recent["weight"].sum() else 0.0)
     exp_ip_season = safe_div(wsum(logs["inningsPitched"], logs["weight"]), logs["weight"].sum() if logs["weight"].sum() else 0.0)
     exp_ip = exp_ip_recent if len(recent) >= 3 else exp_ip_season
@@ -310,6 +313,76 @@ def project_pitcher_outs(player_id: int, season: int, last_n: int, playoff_downw
         "playoff_downweight": playoff_downweight,
     }
 
+def project_pitcher_hits_allowed(player_id: int, season: int, last_n: int, opp_team_id: int = None, playoff_downweight: float = 0.75):
+    """
+    Project Hits Allowed:
+      mean_hits = (H/IP weighted recent+season) * expected_IP * opponent_contact_multiplier
+    opponent_contact_multiplier = (opp H/PA) / (league H/PA)
+    NB variance fit from recent hits-allowed counts (unweighted).
+    """
+    reg = pitcher_game_logs(player_id, season)
+    post = pitcher_postseason_logs(player_id, season)
+    if reg.empty and post.empty:
+        raise RuntimeError("No pitching game logs found (regular or postseason).")
+
+    logs = pd.concat([reg, post], ignore_index=True) if not post.empty else reg.copy()
+    logs["date"] = pd.to_datetime(logs["date"])
+    logs = logs.sort_values("date").reset_index(drop=True)
+    logs["weight"] = 1.0
+    if not post.empty:
+        logs.loc[logs["postseason"] == True, "weight"] = playoff_downweight
+
+    recent = logs.tail(last_n) if len(logs) >= last_n else logs.copy()
+
+    def wsum(series, weights): return float((series.fillna(0) * weights.fillna(0)).sum())
+    def safe_div(a, b): return (a / b) if (b and b > 0) else 0.0
+
+    # H/IP (recent + season)
+    hip_recent = safe_div(wsum(recent["hitsAllowed"], recent["weight"]), wsum(recent["inningsPitched"], recent["weight"]))
+    hip_season = safe_div(wsum(logs["hitsAllowed"], logs["weight"]), wsum(logs["inningsPitched"], logs["weight"]))
+    hip = 0.65 * hip_recent + 0.35 * hip_season
+
+    # Expected IP
+    exp_ip_recent = safe_div(wsum(recent["inningsPitched"], recent["weight"]), recent["weight"].sum() if recent["weight"].sum() else 0.0)
+    exp_ip_season = safe_div(wsum(logs["inningsPitched"], logs["weight"]), logs["weight"].sum() if logs["weight"].sum() else 0.0)
+    exp_ip = exp_ip_recent if len(recent) >= 3 else exp_ip_season
+
+    # Opponent contact multiplier via H/PA
+    if opp_team_id is None:
+        _, _, _, team_id, _ = search_player_by_id(player_id)
+        nxt = next_game_for_team(team_id) if team_id else None
+        if nxt:
+            opp_team_id = nxt["opponent_team_id"]
+
+    contact_mult = 1.0
+    if opp_team_id:
+        opp = team_batting_summary(opp_team_id, season)
+        lge = league_batting_summary(season)
+        opp_h_pa = _ratio(opp.get("hits"), opp.get("plateAppearances"))
+        lge_h_pa = _ratio(lge.get("hits"), lge.get("plateAppearances"))
+        if lge_h_pa > 0:
+            contact_mult = opp_h_pa / lge_h_pa
+
+    mean_hits = max(0.0, hip * exp_ip * contact_mult)
+
+    # Fit dispersion from recent hits-allowed (unweighted integers)
+    hits_recent = recent["hitsAllowed"].round().astype(int).values
+    mean_h = float(hits_recent.mean()) if len(hits_recent) else mean_hits
+    var_h = float(hits_recent.var(ddof=1)) if len(hits_recent) >= 2 else max(mean_hits, 1.0)
+    theta = _fit_theta(mean_h, var_h)
+
+    return {
+        "expected_hits": mean_hits,
+        "theta": theta,
+        "mean_recent": mean_h,
+        "var_recent": var_h,
+        "contact_multiplier": contact_mult,
+        "hits_per_ip_recent": hip_recent,
+        "hits_per_ip_season": hip_season,
+        "exp_ip": exp_ip,
+        "recent_window_len": len(recent),
+    }
+
 # =========================
 # Probability helpers
 # =========================
@@ -324,7 +397,7 @@ def over_under_prob(line: float, lam: float, theta: float):
     return 1.0 - cdf_k, cdf_k
 
 def over_under_prob_count(line: float, mean_count: float, theta: float):
-    """Generic count O/U probability (for Outs)."""
+    """Generic count O/U probability (for Outs or Hits)."""
     if theta is None or theta <= 0 or not math.isfinite(theta) or theta > 1e8:
         return _poisson_over_under(line, mean_count)
     r = float(theta)
@@ -393,14 +466,15 @@ def _poisson_over_under(line: float, lam: float):
 # ========== CONFIG / RUN ==========
 # =========================
 if __name__ == "__main__":
-    # ---- Set LAST_N here (affects modeling AND printed summaries) ----
-    LAST_N = 30   # <--- change this value
+    # ---- Last-N used for modeling and summaries ----
+    LAST_N = 10
 
     # ---- Your prop inputs ----
-    PITCHER_NAME = "Kevin Gausman"
+    PITCHER_NAME = "Max Scherzer"
     SEASON = 2025
-    K_LINE = 5.0
-    OUTS_LINE = 15.5
+    K_LINE = 6.5
+    OUTS_LINE = 8.5
+    HITS_LINE = 3.5
     PLAYOFF_DOWNWEIGHT = 0.75
 
     pid, full, num, team_id, throws = search_player(PITCHER_NAME)
@@ -430,6 +504,13 @@ if __name__ == "__main__":
     mu_outs = proj_outs["expected_outs"]; theta_outs = proj_outs["theta"]
     p_over_outs, p_under_outs = over_under_prob_count(OUTS_LINE, mu_outs, theta_outs)
 
+    # ===== Hits Allowed projection =====
+    proj_hits = project_pitcher_hits_allowed(
+        pid, season=SEASON, last_n=LAST_N, opp_team_id=opp_id, playoff_downweight=PLAYOFF_DOWNWEIGHT
+    )
+    mu_hits = proj_hits["expected_hits"]; theta_hits = proj_hits["theta"]
+    p_over_hits, p_under_hits = over_under_prob_count(HITS_LINE, mu_hits, theta_hits)
+
     # ===== OUTPUT =====
     print("\n--- Projection Summary (Strikeouts) ---")
     print(f"Last N starts (N):           {LAST_N}")
@@ -443,14 +524,24 @@ if __name__ == "__main__":
     print(f"P(Over {K_LINE} Ks):         {p_over_k:.3f}")
     print(f"P(Under {K_LINE} Ks):        {p_under_k:.3f}")
 
-    print(f"\n--- Recent Performance (Last {LAST_N} Starts) ---")
-    print(f"Avg Hits Allowed:            {proj_k['lastN_avg_hits']:.2f}")
-    print(f"Total Hits Allowed:          {proj_k['lastN_total_hits']:.0f}")
-    print("Opponents Faced:             " + ", ".join([o for o in proj_k["lastN_opponents"] if o]))
-
-    print("\n--- Projection Summary (Pitching Outs) ---")
+    print(f"\n--- Projection Summary (Pitching Outs) ---")
     print(f"Expected IP (next):          {proj_outs['exp_ip']:.2f}")
     print(f"Expected Outs (μ):           {mu_outs:.2f}")
     print(f"Fitted theta (NB shape):     {theta_outs:.2f}")
     print(f"P(Over {OUTS_LINE} Outs):    {p_over_outs:.3f}")
     print(f"P(Under {OUTS_LINE} Outs):   {p_under_outs:.3f}")
+
+    print(f"\n--- Projection Summary (Hits Allowed) ---")
+    print(f"Expected IP (next):          {proj_hits['exp_ip']:.2f}")
+    print(f"H/IP recent (weighted):      {proj_hits['hits_per_ip_recent']:.3f}")
+    print(f"H/IP season (weighted):      {proj_hits['hits_per_ip_season']:.3f}")
+    print(f"Opponent contact mult:       {proj_hits['contact_multiplier']:.3f}")
+    print(f"Expected Hits (μ):           {mu_hits:.2f}")
+    print(f"Fitted theta (NB shape):     {theta_hits:.2f}")
+    print(f"P(Over {HITS_LINE} Hits):    {p_over_hits:.3f}")
+    print(f"P(Under {HITS_LINE} Hits):   {p_under_hits:.3f}")
+
+    print(f"\n--- Recent Performance (Last {LAST_N} Starts) ---")
+    print(f"Avg Hits Allowed:            {proj_k['lastN_avg_hits']:.2f}")
+    print(f"Total Hits Allowed:          {proj_k['lastN_total_hits']:.0f}")
+    print("Opponents Faced:             " + ", ".join([o for o in proj_k['lastN_opponents'] if o]))
