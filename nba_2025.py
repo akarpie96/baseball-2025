@@ -337,7 +337,7 @@ def suggest_lines(mean: float,
 # ----------------------------
 if __name__ == "__main__":
     # ===== CONFIG =====
-    PLAYER_NAME = "Bobby Portis"
+    PLAYER_NAME = "Jimmy Butler"
 
     # Seasons/Types to include in the window
     SEASONS = ["2025-26", "2024-25"]
@@ -349,14 +349,14 @@ if __name__ == "__main__":
     PLAYOFF_DOWNWEIGHT = 0.70
 
     # Opponent scaling
-    OPP_TEAM_ABBR = "IND"         # e.g., "LAL", "BOS", "DEN"; set to None to skip
+    OPP_TEAM_ABBR = "PHX"         # e.g., "LAL", "BOS", "DEN"; set to None to skip
     OPP_MULT_SEASON = "2025-26"   # season to use for opponent-allowed stats
 
     # Prop lines to evaluate
-    POINTS_LINE = 27.5
-    REBOUNDS_LINE = 12.5
-    ASSISTS_LINE = 0.5
-    PRA_LINE = 31.5
+    POINTS_LINE = 20.5
+    REBOUNDS_LINE = 1.5
+    ASSISTS_LINE = 2.5
+    PRA_LINE = 21.5
 
     # Suggestions
     ENABLE_SUGGESTIONS = True
@@ -436,6 +436,29 @@ if __name__ == "__main__":
     print("\n--- Recent games (most recent last) ---")
     cols = ["GAME_DATE", "SEASON", "SEASON_TYPE", "MATCHUP", "MIN", "PTS", "REB", "AST", "WEIGHT"]
     print(lastN[cols].to_string(index=False, formatters={"WEIGHT": lambda x: f"{x:.3f}"}))
+
+
+        # ===== CSV-ready output for pp_entry_builder_nba.py =====
+    def _csv_row(stat: str, line: float, p_over: float, p_under: float) -> str:
+        # decide side, p, edge
+        if p_over >= p_under:
+            side = "Over"
+            p = p_over
+        else:
+            side = "Under"
+            p = p_under
+        edge = p - 0.5
+        group = f"{OPP_TEAM_ABBR} matchup" if OPP_TEAM_ABBR else ""
+        # CSV schema: player,stat,line,side,p,edge,group
+        return f'"{PLAYER_NAME}",{stat},{line},{side},{p:.3f},{edge:.3f},"{group}"'
+
+    print("\n=== Copy this into your CSV (props.csv / prop_bet.csv) ===")
+    print("player,stat,line,side,p,edge,group")
+    print(_csv_row("PTS", POINTS_LINE, p_over_pts, p_under_pts))
+    print(_csv_row("REB", REBOUNDS_LINE, p_over_reb, p_under_reb))
+    print(_csv_row("AST", ASSISTS_LINE, p_over_ast, p_under_ast))
+    print(_csv_row("PRA", PRA_LINE, p_over_pra, p_under_pra))
+    print("=== End CSV block ===\n")
 
     # ===== Suggestions
     if ENABLE_SUGGESTIONS:
